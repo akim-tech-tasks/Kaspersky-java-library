@@ -3,6 +3,8 @@ package ru.cu.advancedgit.core;
 import ru.cu.advancedgit.api.TextFileIndexer;
 import ru.cu.advancedgit.index.InMemoryInvertedIndex;
 import ru.cu.advancedgit.tokenizer.Tokenizer;
+import ru.cu.advancedgit.watcher.DirectoryWatcher;
+import ru.cu.advancedgit.watcher.FileChangeListener;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -10,42 +12,53 @@ import java.nio.file.Path;
 import java.util.Locale;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Stream;
 
-/**
- * Default in-memory implementation of the text file indexer.
- */
 public class DefaultTextFileIndexer implements TextFileIndexer {
 
     private final InMemoryInvertedIndex index;
     private final FileIndexer fileIndexer;
+    private final DirectoryWatcher directoryWatcher;
+    private final AtomicBoolean closed = new AtomicBoolean(false);
 
     public DefaultTextFileIndexer(Tokenizer tokenizer) {
         Objects.requireNonNull(tokenizer, "tokenizer must not be null");
+
         this.index = new InMemoryInvertedIndex();
         this.fileIndexer = new FileIndexer(tokenizer, index);
+        this.directoryWatcher = new DirectoryWatcher(createFileChangeListener());
+        this.directoryWatcher.start();
     }
 
     @Override
     public void addFile(Path file) {
+        ensureOpen();
         fileIndexer.indexFile(file);
     }
 
     @Override
     public void addDirectory(Path directory) {
+        ensureOpen();
         validateDirectory(directory);
 
-        try (Stream<Path> paths = Files.walk(directory)) {
+        Path normalizedDirectory = directory.toAbsolutePath().normalize();
+
+        try (Stream<Path> paths = Files.walk(normalizedDirectory)) {
             paths.filter(Files::isRegularFile)
                     .filter(this::isSupportedTextFile)
                     .forEach(fileIndexer::indexFile);
         } catch (IOException e) {
             throw new RuntimeException("Failed to index directory: " + directory, e);
         }
+
+        directoryWatcher.registerDirectory(normalizedDirectory);
     }
 
     @Override
     public Set<Path> search(String word) {
+        ensureOpen();
+
         if (word == null || word.isBlank()) {
             return Set.of();
         }
@@ -55,6 +68,7 @@ public class DefaultTextFileIndexer implements TextFileIndexer {
 
     @Override
     public void remove(Path path) {
+        ensureOpen();
         Objects.requireNonNull(path, "path must not be null");
 
         Path normalizedPath = path.toAbsolutePath().normalize();
@@ -79,6 +93,34 @@ public class DefaultTextFileIndexer implements TextFileIndexer {
 
     @Override
     public void close() {
+        if (closed.compareAndSet(false, true)) {
+            directoryWatcher.close();
+        }
+    }
+
+    private FileChangeListener createFileChangeListener() {
+        return new FileChangeListener() {
+            @Override
+            public void onCreate(Path path) {
+                if (isSupportedTextFile(path) && Files.isRegularFile(path)) {
+                    fileIndexer.indexFile(path);
+                }
+            }
+
+            @Override
+            public void onModify(Path path) {
+                if (isSupportedTextFile(path) && Files.isRegularFile(path)) {
+                    fileIndexer.indexFile(path);
+                }
+            }
+
+            @Override
+            public void onDelete(Path path) {
+                if (isSupportedTextFile(path)) {
+                    fileIndexer.removeFile(path);
+                }
+            }
+        };
     }
 
     private void validateDirectory(Path directory) {
@@ -95,12 +137,22 @@ public class DefaultTextFileIndexer implements TextFileIndexer {
         }
     }
 
+    private void ensureOpen() {
+        if (closed.get()) {
+            throw new IllegalStateException("Indexer is already closed");
+        }
+    }
+
     private String normalizeWord(String word) {
         return word.toLowerCase(Locale.ROOT).trim();
     }
 
     private boolean isSupportedTextFile(Path path) {
-        String fileName = path.getFileName().toString().toLowerCase(Locale.ROOT);
-        return fileName.endsWith(".txt");
+        Path fileName = path.getFileName();
+        if (fileName == null) {
+            return false;
+        }
+
+        return fileName.toString().toLowerCase(Locale.ROOT).endsWith(".txt");
     }
 }
